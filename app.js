@@ -1,0 +1,208 @@
+#! /usr/bin/env node
+
+'use strict';
+
+const _ = require('lodash'),
+    Promise = require('bluebird'),
+    ProviderAWSEC2 = require('./server/providers/awsec2'),
+    ProviderDigitalOcean = require('./server/providers/digitalocean'),
+    ProviderOVHCloud = require('./server/providers/ovhcloud'),
+    ProviderVscale = require('./server/providers/vscale'),
+    fs = require('fs'),
+    moment = require('moment'),
+    ovh = require('ovh'),
+    path = require('path'),
+    program = require('commander'),
+    Proxies = require('./server/proxies'),
+    sigstop = require('./server/common/sigstop'),
+    template = require('./server/template'),
+    TestProxy = require('./server/test-proxy'),
+    winston = require('winston');
+
+const configDefaults = require('./server/config.defaults');
+
+// Add timestamp to log
+winston.remove(winston.transports.Console);
+winston.add(winston.transports.Console, { timestamp: true });
+
+debugMode();
+startProxy('server/my-conf.json');
+
+////////////
+
+function initConfig(configFilename) {
+    if (!configFilename || configFilename.length <= 0) {
+        return winston.error('[Template] Error: Config file not specified');
+    }
+
+    fs.exists(configFilename, exists => {
+        if (exists) {
+            return winston.error(
+                '[Template] Error: Config file already exists'
+            );
+        }
+
+        template.write(configFilename, err => {
+            if (err) {
+                return winston.error(
+                    '[Template] Error: Cannot write template to',
+                    configFilename
+                );
+            }
+
+            winston.info('[Template] Template written in', configFilename);
+        });
+    });
+}
+
+function startProxy(configFilename) {
+    if (!configFilename || configFilename.length <= 0) {
+        return winston.error('[Start] Error: Config file not specified');
+    }
+
+    configFilename = path.resolve(process.cwd(), configFilename);
+
+    // Load config
+    let config;
+    try {
+        config = _.merge({}, configDefaults, require(configFilename));
+    } catch (err) {
+        return winston.error('[Start] Error: Cannot load config:', err);
+    }
+
+    // Write logs (if specified)
+    if (config.logs && config.logs.path) {
+        winston.add(winston.transports.File, {
+            filename: `{config.logs.path}/scrapoxy_${moment().format(
+                'YYYYMMDD_HHmmss'
+            )}.log`,
+            json: false,
+            timestamp: true
+        });
+    }
+
+    // Initialize
+    const provider = getProvider(config);
+    if (!provider) {
+        return winston.error(
+            '[Start] Error: Provider is not specify or supported'
+        );
+    }
+
+    const main = new Proxies(config, provider);
+
+    // Register stop event
+    sigstop(() => main.shutdown().then(() => process.exit(0)));
+
+    // Start
+    main.listen();
+
+    ////////////
+
+    function getProvider(cfg) {
+        switch (cfg.providers.type) {
+            case 'awsec2': {
+                return new ProviderAWSEC2(
+                    cfg.providers.awsec2,
+                    cfg.instance.port
+                );
+            }
+
+            case 'digitalocean': {
+                return new ProviderDigitalOcean(
+                    cfg.providers.digitalocean,
+                    cfg.instance.port
+                );
+            }
+
+            case 'ovhcloud': {
+                return new ProviderOVHCloud(
+                    cfg.providers.ovhcloud,
+                    cfg.instance.port
+                );
+            }
+
+            case 'vscale': {
+                return new ProviderVscale(
+                    cfg.providers.vscale,
+                    cfg.instance.port
+                );
+            }
+
+            default: {
+                return;
+            }
+        }
+    }
+}
+
+function testProxy(proxyUrl, count) {
+    if (!proxyUrl || proxyUrl.length <= 0) {
+        return winston.error('[Test] Error: URL not specified');
+    }
+
+    // Default: 10 / Max: 1000
+    count = Math.min(count || 10, 1000);
+
+    const proxy = new TestProxy(proxyUrl);
+
+    const promises = [];
+    for (let i = 0; i < count; ++i) {
+        promises.push(proxy.request());
+    }
+
+    Promise.all(promises)
+        .then(() => {
+            winston.info('[Test] %d IPs found:', proxy.size);
+
+            proxy.count.forEach((value, key) =>
+                winston.info('[Test] %s (%d times)', key, value)
+            );
+        })
+        .catch(err => {
+            winston.error('[Test] Error: Cannot get IP address:', err);
+        });
+}
+
+function ovhConsumerKey(endpoint, appKey, appSecret) {
+    if (!appKey || appKey.length <= 0 || !appSecret || appSecret.length <= 0) {
+        return winston.error('[OVH] Error: appKey or appSecret not specified');
+    }
+
+    const client = ovh({
+        endpoint,
+        appKey,
+        appSecret
+    });
+
+    client.request(
+        'POST',
+        '/auth/credential',
+        {
+            accessRules: [
+                { method: 'GET', path: '/cloud/*' },
+                { method: 'POST', path: '/cloud/*' },
+                { method: 'PUT', path: '/cloud/*' },
+                { method: 'DELETE', path: '/cloud/*' }
+            ]
+        },
+        (err, credential) => {
+            if (err) {
+                return winston.error(
+                    '[OVH] Error: Cannot get consumerKey:',
+                    err
+                );
+            }
+
+            winston.info('[OVH] Your consumerKey is:', credential.consumerKey);
+            winston.info(
+                '[OVH] Please validate your token here:',
+                credential.validationUrl
+            );
+        }
+    );
+}
+
+function debugMode() {
+    winston.level = 'debug';
+}
